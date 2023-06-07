@@ -1,0 +1,6 @@
+2023-05-08 03:36:01 [INFO] [train_classification.py:72] : Epoch: 0, loss: 0.7164491016517653, val_acc: 0.9049409536541889
+2023-05-08 03:38:09 [INFO] [train_classification.py:72] : Epoch: 1, loss: 0.18571536297199825, val_acc: 0.9305091354723708
+2023-05-08 03:40:16 [INFO] [train_classification.py:72] : Epoch: 2, loss: 0.11106257624495988, val_acc: 0.9177807486631016
+2023-05-08 03:42:23 [INFO] [train_classification.py:72] : Epoch: 3, loss: 0.09654092627766603, val_acc: 0.9202038770053476
+2023-05-08 03:44:31 [INFO] [train_classification.py:72] : Epoch: 4, loss: 0.1066857901155606, val_acc: 0.9148841354723708
+2023-05-08 03:46:38 [INFO] [train_classification.py:72] : Epoch: 5, loss: 0.08508669165359146, val_acc: 0.900735294117647
