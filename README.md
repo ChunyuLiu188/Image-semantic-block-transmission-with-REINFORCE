@@ -70,7 +70,7 @@ class sample(nn.Module):
 整体模型训练分为三部分，分别为去噪网络训练（去除信道噪声，信道编码），分类器网络微调（去噪完图像的分布与原图分布发生变化，微调分类器最后三层），策略网络训练， 依次进行。其中策略网络的训练分为三个阶段。第一阶段固定信道增益感知网络的参数，优化图像感知网络和决策网络的参数；第二阶段固定图像感知网络的参数，优化其他两个网络的参数；第三阶段同时优化三个网络的参数。
 
 # 感谢
-
+[Task-Oriented Image Transmission for Scene Classification in Unmanned Aerial Systems](https://ieeexplore.ieee.org/document/9796572)
 @ARTICLE{
   author={Kang, Xu and Song, Bin and Guo, Jie and Qin, Zhijin and Yu, Fei Richard},
   journal={IEEE Transactions on Communications}, 
