@@ -1,0 +1,295 @@
+import tensorflow as tf
+from tensorflow import keras
+from tqdm import trange
+import numpy as np
+import keras.backend as K
+import matplotlib.pyplot as plt
+import logging
+from train_sample import Sample
+import tensorflow_probability as tfp
+
+logging.basicConfig(format='%(asctime)s [%(levelname)s] [%(filename)s:%(lineno)d] : %(message)s',
+                    datefmt='%Y-%m-%d %H:%M:%S',
+                    filename="log/train_policy.log")
+logging.getLogger().setLevel(logging.DEBUG)
+logger = logging.getLogger()
+
+GAIN_LIST = [0., 0.16666667, 0.33333333, 0.5, 0.66666667, 0.83333333, 1.]
+class Policy(tf.keras.Model):
+    def __init__(self, n_actions):
+        super(Policy, self).__init__()
+
+        self.f_features = tf.keras.Sequential([keras.applications.VGG16(include_top=False, weights='imagenet'),
+                                               keras.layers.GlobalAveragePooling2D(),
+                                               keras.layers.Dense(512, use_bias=False)])
+
+        self.f_gain = tf.keras.Sequential([
+            tf.keras.layers.Dense(128, use_bias=False),
+            tf.keras.layers.Activation('tanh'),
+            tf.keras.layers.Dense(512, use_bias=False)
+        ])
+
+        self.f_decision = tf.keras.Sequential([
+            tf.keras.layers.Dense(128, use_bias=False),
+            tf.keras.layers.Activation('tanh'),
+            tf.keras.layers.Dense(n_actions, use_bias=False)
+        ])
+
+    def call(self, inputs, gains):
+        out = self.f_features(inputs)
+        gain_feature = self.f_gain(gains)
+        out = self.f_decision(out + gain_feature)
+        return out
+
+
+class Denoise(keras.Model):
+    def __init__(self):
+        super(Denoise, self).__init__()
+
+        self.model = tf.keras.Sequential([
+            tf.keras.layers.Conv2D(64, kernel_size=(3, 3), strides=1, padding='same', use_bias=False),
+            tf.keras.layers.ReLU(),
+            tf.keras.layers.Conv2D(3, kernel_size=(3, 3), strides=1, padding='same', use_bias=False)
+        ])
+
+    def call(self, x):
+        out = self.model(x)
+        out = x - out
+        return out
+
+
+def process(img, labels):
+    img = keras.applications.resnet.preprocess_input(img)
+    return img, labels
+
+
+dataset = keras.utils.image_dataset_from_directory("data", label_mode="int", image_size=(224, 224), batch_size=64)
+# 定义划分比例
+train_ratio = 0.8  # 训练集比例
+val_ratio = 0.1  # 验证集比例
+test_ratio = 0.1  # 测试集比例
+dataset_size = len(dataset)
+dataset = dataset.shuffle(dataset_size)
+# 计算划分后的样本数量
+train_size = int(train_ratio * dataset_size)
+val_size = int(val_ratio * dataset_size)
+test_size = int(test_ratio * dataset_size)
+
+# 划分数据集
+train_dataset = dataset.take(train_size)
+val_dataset = dataset.skip(train_size).take(val_size)
+test_dataset = dataset.skip(train_size + val_size).take(test_size)
+
+train_dataset = train_dataset.map(process).prefetch(tf.data.experimental.AUTOTUNE)
+val_dataset = val_dataset.map(process).prefetch(tf.data.experimental.AUTOTUNE)
+test_dataset = test_dataset.map(process).prefetch(tf.data.experimental.AUTOTUNE)
+
+
+@tf.function
+def train_rec(imgs):
+    with tf.GradientTape() as tape:
+        sample_img = sample_model.k(imgs)
+        noise = tf.random.normal(shape=sample_img.shape, mean=0, stddev=0.01)
+        receive_img = sample_img + noise
+        recover_img = sample_model.k_auxiliary(receive_img)
+        denoise_img = denoise_model(recover_img)
+        loss = tf.reduce_mean(keras.losses.mean_absolute_error(denoise_img, imgs))
+    gradient = tape.gradient(loss, denoise_model.trainable_variables)
+    optimizer.apply_gradients(zip(gradient, denoise_model.trainable_variables))
+
+@tf.function
+def train_cls(imgs):
+    with tf.GradientTape() as tape:
+        sample_img = sample_model.k(imgs)
+        noise = tf.random.normal(shape=sample_img.shape, mean=0, stddev=0.01)
+        receive_img = sample_img + noise
+        recover_img = sample_model.k_auxiliary(receive_img)
+        denoise_img = denoise_model(recover_img, training=False)
+        predict = cls_model(denoise_img)
+        loss = tf.reduce_mean(keras.losses.sparse_categorical_crossentropy(predict, labels))
+    gradient = tape.gradient(loss, cls_model.trainable_variables)
+    optimizer.apply_gradients(zip(gradient, cls_model.trainable_variables))
+
+
+def get_reward(pre, labels, policy_sample, r_dbs):
+    labels = tf.cast(labels, tf.int64)
+    eq = tf.cast(tf.equal(pre, labels), tf.float32)
+    n_blocks = tf.cast(tf.reduce_sum(policy_sample, -1), tf.float32)
+    r_dbs = tf.cast(r_dbs, tf.float32)
+    latency = (n_blocks * 8. * 64. * 64. * 0.3 / r_dbs) * eq * 1e-3
+    latency = (1 / (1 + 2*latency))
+    reward = tf.reduce_sum(latency) + (64 - tf.reduce_sum(eq)) * 0.15
+    return reward
+
+
+
+
+@tf.function
+def train_policy_stage1(imgs, labels, gains, epoch, opti):
+    with tf.GradientTape() as tape:
+        probs = tf.sigmoid(policy_model(imgs, gains))
+        alpha_hp = tf.clip_by_value(0.7 + 0.0026 * epoch, 0.7, 0.95)
+
+        probs = probs * alpha_hp + (1 - alpha_hp) * (1 - probs)
+
+        # 创建 Bernoulli 分布对象并进行采样
+        distr = tfp.distributions.Bernoulli(probs=probs)
+        policy_sample = distr.sample()
+
+        policy_sample2 = tf.reshape(policy_sample, [policy_sample.shape[0], 4, 4])
+        policy_sample2 = tf.repeat(policy_sample2, repeats=56, axis=1)
+        policy_sample2 = tf.repeat(policy_sample2, repeats=56, axis=2)
+
+        policy_sample2 = tf.expand_dims(policy_sample2, axis=-1)
+        policy_sample2 = tf.repeat(policy_sample2, repeats=3, axis=-1)
+        policy_sample2 = tf.cast(policy_sample2, tf.float32)
+
+        pictures_blocks = tf.multiply(policy_sample2, imgs)
+
+        sample_img = sample_model.k(pictures_blocks, training=False)
+        noise = tf.random.normal(shape=sample_img.shape, mean=0, stddev=0.01)
+        receive_img = sample_img + noise
+        recover_img = sample_model.k_auxiliary(receive_img, training=False)
+        denoise_img = denoise_model(recover_img, training=False)
+
+        predict = tf.argmax(cls_model(denoise_img), axis=-1)
+        reward = get_reward(predict, labels, policy_sample, gains)
+        loss = -distr.log_prob(policy_sample)
+        loss *= reward
+        loss = tf.reduce_mean(loss)
+
+    gradient = tape.gradient(loss, policy_model.trainable_variables)
+    opti.apply_gradients(zip(gradient, policy_model.trainable_variables))
+    return loss, reward
+@tf.function
+def train_policy_stage2(imgs, labels, gains, epoch, opti):
+    with tf.GradientTape() as tape:
+        probs = tf.sigmoid(policy_model(imgs, gains))
+        alpha_hp = tf.clip_by_value(0.7 + 0.0026 * epoch, 0.7, 0.95)
+
+        probs = probs * alpha_hp + (1 - alpha_hp) * (1 - probs)
+
+        # 创建 Bernoulli 分布对象并进行采样
+        distr = tfp.distributions.Bernoulli(probs=probs)
+        policy_sample = distr.sample()
+
+        policy_sample2 = tf.reshape(policy_sample, [policy_sample.shape[0], 4, 4])
+        policy_sample2 = tf.repeat(policy_sample2, repeats=56, axis=1)
+        policy_sample2 = tf.repeat(policy_sample2, repeats=56, axis=2)
+
+        policy_sample2 = tf.expand_dims(policy_sample2, axis=-1)
+        policy_sample2 = tf.repeat(policy_sample2, repeats=3, axis=-1)
+        policy_sample2 = tf.cast(policy_sample2, tf.float32)
+
+        pictures_blocks = tf.multiply(policy_sample2, imgs)
+
+        sample_img = sample_model.k(pictures_blocks, training=False)
+        noise = tf.random.normal(shape=sample_img.shape, mean=0, stddev=0.01)
+        receive_img = sample_img + noise
+        recover_img = sample_model.k_auxiliary(receive_img, training=False)
+        denoise_img = denoise_model(recover_img, training=False)
+
+        predict = tf.argmax(cls_model(denoise_img), axis=-1)
+        reward = get_reward(predict, labels, policy_sample, gains)
+        loss = -distr.log_prob(policy_sample)
+        loss *= reward
+        loss = tf.reduce_mean(loss)
+
+    gradient = tape.gradient(loss, policy_model.trainable_variables)
+    opti.apply_gradients(zip(gradient, policy_model.trainable_variables))
+    return loss, reward
+@tf.function
+def train_policy_stage3(imgs, labels, gains, epoch, opti):
+    with tf.GradientTape() as tape:
+        probs = tf.sigmoid(policy_model(imgs, gains))
+        alpha_hp = tf.clip_by_value(0.7 + 0.0026 * epoch, 0.7, 0.95)
+
+        probs = probs * alpha_hp + (1 - alpha_hp) * (1 - probs)
+
+        # 创建 Bernoulli 分布对象并进行采样
+        distr = tfp.distributions.Bernoulli(probs=probs)
+        policy_sample = distr.sample()
+
+        policy_sample2 = tf.reshape(policy_sample, [policy_sample.shape[0], 4, 4])
+        policy_sample2 = tf.repeat(policy_sample2, repeats=56, axis=1)
+        policy_sample2 = tf.repeat(policy_sample2, repeats=56, axis=2)
+
+        policy_sample2 = tf.expand_dims(policy_sample2, axis=-1)
+        policy_sample2 = tf.repeat(policy_sample2, repeats=3, axis=-1)
+        policy_sample2 = tf.cast(policy_sample2, tf.float32)
+
+        pictures_blocks = tf.multiply(policy_sample2, imgs)
+
+        sample_img = sample_model.k(pictures_blocks, training=False)
+        noise = tf.random.normal(shape=sample_img.shape, mean=0, stddev=0.01)
+        receive_img = sample_img + noise
+        recover_img = sample_model.k_auxiliary(receive_img, training=False)
+        denoise_img = denoise_model(recover_img, training=False)
+
+        predict = tf.argmax(cls_model(denoise_img), axis=-1)
+        reward = get_reward(predict, labels, policy_sample, gains)
+        loss = -distr.log_prob(policy_sample)
+        loss *= reward
+        loss = tf.reduce_mean(loss)
+
+    gradient = tape.gradient(loss, policy_model.trainable_variables)
+    opti.apply_gradients(zip(gradient, policy_model.trainable_variables))
+    return loss, reward
+# 	val_dataset = iter(val_dataset)
+# 	imgs, _ = next(val_dataset)
+# 	out = model(imgs)
+# 	mean = K.constant(np.array([103.939, 116.779, 123.68]))
+# 	img = K.bias_add(out, mean)
+# 	img = (img[..., ::-1][0] / 255).numpy()
+# 	img = np.clip(img, 0, 1)
+# 	# RGB-->BGR
+# 	plt.imsave("rec.png", img)
+if __name__ == "__main__":
+    cls_model = keras.models.load_model("cls.h5")
+    for layers in cls_model.layers[:-16]:
+        layers.trainable = False
+    sample_model = Sample()
+    _ = sample_model(tf.keras.Input(shape=(224, 224, 3)))
+    sample_model.load_weights("sample.h5")
+    sample_model.trainable = False
+    denoise_model = Denoise()
+    policy_model = Policy(16)
+    optimizer = keras.optimizers.Adam(1e-4)
+    optimizer_stage1 = keras.optimizers.Adam(1e-3)
+    optimizer_stage2 = keras.optimizers.Adam(1e-3)
+    optimizer_stage3 = keras.optimizers.Adam(1e-3)
+    
+    # for epoch in trange(10):
+    # 	for imgs, _ in train_dataset:
+    # 		train_rec(imgs)
+    # for epoch in trange(10):
+    # 	for imgs, labels in train_dataset:
+    # 		train_cls(imgs)
+    for epoch in trange(100):
+        for stage in range(3):
+            Loss, Reward = [], []
+            for imgs, labels in train_dataset:
+                gains = np.random.choice(GAIN_LIST, size=1)
+                gains = np.tile(gains, (imgs.shape[0], 1))
+                if stage == 0:
+                    policy_model.f_features.trainable = False
+                    loss, reward = train_policy_stage1(imgs, labels, gains, epoch, optimizer_stage1)
+                    Loss.append(loss)
+                    Reward.append(loss)
+                if stage == 1:
+                    policy_model.f_features.trainable = True
+                    policy_model.f_gain.trainable = False
+                    loss, reward = train_policy_stage2(imgs, labels, gains, epoch, optimizer_stage2)
+                    Loss.append(loss)
+                    Reward.append(loss)
+                if stage == 2:
+                    policy_model.f_gain.trainable = True
+                    loss, reward = train_policy_stage3(imgs, labels, gains, epoch, optimizer_stage3)
+                    Loss.append(loss)
+                    Reward.append(loss)
+            logger.info(f"epoch:{epoch}, stage:{stage}, loss:{np.mean(Loss)}, reward:{np.mean(Reward)}")
+
+
+
+
+
