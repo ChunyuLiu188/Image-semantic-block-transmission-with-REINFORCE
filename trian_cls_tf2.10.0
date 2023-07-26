@@ -1,0 +1,54 @@
+import tensorflow as tf
+from tensorflow import keras
+import keras.backend as K
+import numpy as np
+
+tf.random.set_seed(2023)
+
+
+def process(img, labels):
+	img = img[..., ::-1]  # RGB-->BGR
+	mean = K.constant(-np.array([103.939, 116.779, 123.68]))
+	img = K.bias_add(img, mean)
+	return img, labels
+
+
+dataset = keras.utils.image_dataset_from_directory("data", label_mode="categorical", batch_size=64, image_size=(224, 224))
+# 定义划分比例
+train_ratio = 0.8  # 训练集比例
+val_ratio = 0.1  # 验证集比例
+test_ratio = 0.1  # 测试集比例
+dataset_size = len(dataset)
+dataset = dataset.shuffle(dataset_size)
+# 计算划分后的样本数量
+train_size = int(train_ratio * dataset_size)
+val_size = int(val_ratio * dataset_size)
+test_size = int(test_ratio * dataset_size)
+
+# 划分数据集
+train_dataset = dataset.take(train_size)
+val_dataset = dataset.skip(train_size).take(val_size)
+test_dataset = dataset.skip(train_size + val_size).take(test_size)
+
+train_dataset = train_dataset.map(process).prefetch(tf.data.experimental.AUTOTUNE)
+val_dataset = val_dataset.map(process).prefetch(tf.data.experimental.AUTOTUNE)
+test_dataset = test_dataset.map(process).prefetch(tf.data.experimental.AUTOTUNE)
+
+
+base_model = keras.applications.ResNet50(include_top=False, weights="imagenet")
+base_model.trainable = False
+output = base_model.output
+output = keras.layers.GlobalAveragePooling2D()(output)
+output = keras.layers.Dense(512, activation="relu")(output)
+output = keras.layers.Dropout(0.2)(output)
+output = keras.layers.Dense(128, activation="relu")(output)
+output = keras.layers.Dropout(0.2)(output)
+output = keras.layers.Dense(45, activation="softmax")(output)
+model = keras.models.Model(base_model.input, output)
+optimizer = keras.optimizers.Adam(1e-4)
+loss_fn = keras.losses.CategoricalCrossentropy()
+early_stopping = keras.callbacks.EarlyStopping("accuracy", patience=2)
+model.compile(optimizer, loss_fn, ["accuracy"])
+model.fit(train_dataset, epochs=20, callbacks=[early_stopping], validation_data=val_dataset)
+model.save("cls.h5")
+model.evaluate(test_dataset)
